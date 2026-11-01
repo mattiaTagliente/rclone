@@ -56,6 +56,7 @@ type File struct {
 	virtualModTime   *time.Time                      // modtime for backends with Precision == fs.ModTimeNotSupported
 	pendingModTime   time.Time                       // will be applied once o becomes available, i.e. after file was written
 	pendingRenameFun func(ctx context.Context) error // will be run/renamed after all writers close
+	storedAt         time.Time                       // when setObject last stored a written object
 	nwriters         atomic.Int32                    // len(writers)
 	appendMode       bool                            // file was opened with O_APPEND
 	isLink           bool                            // file represents a symlink
@@ -539,6 +540,7 @@ func (f *File) setSize(n int64) {
 func (f *File) setObject(o fs.Object) {
 	f.mu.Lock()
 	f.o = o
+	f.storedAt = time.Now()
 	f._setIsLink()
 	_ = f._applyPendingModTime()
 	d := f.d
@@ -548,10 +550,48 @@ func (f *File) setObject(o fs.Object) {
 	d.addObject(f)
 }
 
-// Update the object but don't update the directory cache - for use by
-// the directory cache
-func (f *File) setObjectNoUpdate(o fs.Object) {
+// Update the object from a directory listing started at when, but
+// don't update the directory cache - for use by the directory cache
+//
+// The current object is kept if the listing may predate it: the file
+// is open for write, its cache item is dirty (not yet uploaded or being
+// uploaded), or setObject stored it after the listing started. A
+// listing fetched while an upload is in flight is applied after the
+// upload has stored the new object, and would otherwise put back the
+// pre-upload object: the next open would then find the remote
+// fingerprint different from the cached one, remove the cache file as
+// stale and truncate it to the old size, losing the data written.
+//
+// The dirty check covers the upload in flight: Item._store calls
+// storeFn with the item lock released and marks the item clean only
+// after storeFn returns, so while storeFn waits for the Dir lock in
+// addObject the item is still dirty. That release is also why taking
+// the cache and item locks here, under the Dir lock, cannot deadlock.
+//
+// Call with the parent Dir lock held and the File lock not held
+func (f *File) setObjectFromListing(o fs.Object, when time.Time) {
+	f.mu.RLock()
+	d, cachePath := f.d, f._cachePath()
+	f.mu.RUnlock()
+	dirty := d.vfs.Opt.CacheMode >= vfscommon.CacheModeMinimal && d.vfs.cache.DirtyItem(cachePath) != nil
+
 	f.mu.Lock()
+	if f.o != nil {
+		reason := ""
+		switch {
+		case len(f.writers) != 0:
+			reason = "open for write"
+		case dirty:
+			reason = "dirty in the cache"
+		case !when.IsZero() && f.storedAt.After(when):
+			reason = "stored after the listing started"
+		}
+		if reason != "" {
+			fs.Debugf(f._path(), "Keeping current object over listed one: %s", reason)
+			f.mu.Unlock()
+			return
+		}
+	}
 	f.o = o
 	f._setIsLink()
 	f.virtualModTime = nil

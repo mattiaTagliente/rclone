@@ -569,7 +569,7 @@ func (d *Dir) _readDir() error {
 		entries = filteredEntries
 	}
 
-	err = d._readDirFromEntries(entries, nil, time.Time{})
+	err = d._readDirFromEntries(entries, nil, when)
 	if err != nil {
 		return err
 	}
@@ -745,7 +745,7 @@ func (d *Dir) _readDirFromEntries(entries fs.DirEntries, dirTree dirtree.DirTree
 			obj := item
 			// Reuse old file value if it exists
 			if file, ok := node.(*File); node != nil && ok {
-				file.setObjectNoUpdate(obj)
+				file.setObjectFromListing(obj, when)
 			} else {
 				node = newFile(d, d.path, obj, name)
 			}

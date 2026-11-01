@@ -14,6 +14,7 @@ import (
 	"unsafe"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/list"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/vfs/vfscommon"
@@ -856,4 +857,75 @@ func TestDirMetadataExtension(t *testing.T) {
 	if !errors.Is(err, fs.ErrorCantUploadEmptyFiles) {
 		require.NoError(t, err)
 	}
+}
+
+// TestDirReadDirFromEntriesKeepsUploadedObject checks that a listing
+// fetched before an upload finished cannot put back the pre-upload
+// object once the upload has been written back to the VFS layer,
+// while a listing fetched afterwards still applies a remote change.
+//
+// Without the guard the stale listing resets File.o to the old object,
+// the next open finds the remote fingerprint different from the cached
+// one, removes the cache file as stale and truncates it to the old
+// size, so an O_APPEND writer loses what it wrote in between.
+func TestDirReadDirFromEntriesKeepsUploadedObject(t *testing.T) {
+	ctx := context.Background()
+	opt := vfscommon.Opt
+	opt.CacheMode = vfscommon.CacheModeFull
+	opt.WriteBack = 0 // upload synchronously on close
+	r, vfs := newTestVFSOpt(t, &opt)
+
+	r.WriteObject(ctx, "dir/file1", "old", t1)
+	node, err := vfs.Stat("dir")
+	require.NoError(t, err)
+	d := node.(*Dir)
+
+	// The listing a relist fetches while the upload is in flight
+	staleWhen := time.Now()
+	staleEntries, err := list.DirSorted(ctx, r.Fremote, false, "dir")
+	require.NoError(t, err)
+
+	newContents := "new and longer contents"
+	require.NoError(t, vfs.WriteFile("dir/file1", []byte(newContents), 0600))
+	vfs.WaitForWriters(waitForWritersDelay)
+
+	node, err = vfs.Stat("dir/file1")
+	require.NoError(t, err)
+	file := node.(*File)
+	require.Equal(t, int64(len(newContents)), file.getObject().Size())
+
+	// The stale listing is applied after the writeback
+	d.mu.Lock()
+	err = d._readDirFromEntries(staleEntries, nil, staleWhen)
+	d.mu.Unlock()
+	require.NoError(t, err)
+	assert.Equal(t, int64(len(newContents)), file.getObject().Size(), "stale listing replaced the uploaded object")
+	got, err := vfs.ReadFile("dir/file1")
+	require.NoError(t, err)
+	assert.Equal(t, newContents, string(got))
+
+	// An open writer keeps its object even with no listing time
+	fh, err := vfs.OpenFile("dir/file1", os.O_WRONLY|os.O_APPEND, 0600)
+	require.NoError(t, err)
+	d.mu.Lock()
+	err = d._readDirFromEntries(staleEntries, nil, time.Time{})
+	d.mu.Unlock()
+	require.NoError(t, err)
+	assert.Equal(t, int64(len(newContents)), file.getObject().Size(), "listing replaced the object of an open writer")
+	require.NoError(t, fh.Close())
+	vfs.WaitForWriters(waitForWritersDelay)
+
+	// A listing fetched after the upload still applies a remote change
+	peerContents := "changed on the remote by somebody else"
+	file.mu.RLock()
+	freshWhen := file.storedAt.Add(time.Nanosecond)
+	file.mu.RUnlock()
+	r.WriteObject(ctx, "dir/file1", peerContents, t2)
+	freshEntries, err := list.DirSorted(ctx, r.Fremote, false, "dir")
+	require.NoError(t, err)
+	d.mu.Lock()
+	err = d._readDirFromEntries(freshEntries, nil, freshWhen)
+	d.mu.Unlock()
+	require.NoError(t, err)
+	assert.Equal(t, int64(len(peerContents)), file.getObject().Size(), "fresh listing did not apply the remote change")
 }

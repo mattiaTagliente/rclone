@@ -262,11 +262,15 @@ func (fh *RWFileHandle) _readAt(b []byte, off int64, release bool) (n int, err e
 	if fh.writeOnly() {
 		return n, EBADF
 	}
-	if off >= fh._size() {
-		return n, io.EOF
-	}
+	// Open first: the open checks the remote object and refreshes a
+	// stale cache item, so the size read below is the current one. A
+	// clean cached item of size 0 would otherwise answer EOF at offset 0
+	// for ever, after the remote file had grown.
 	if err = fh.openPending(); err != nil {
 		return n, err
+	}
+	if off >= fh._size() {
+		return n, io.EOF
 	}
 	if release {
 		// Do the writing with fh.mu unlocked

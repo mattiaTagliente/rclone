@@ -759,3 +759,50 @@ func TestRWCacheUpdate(t *testing.T) {
 		fstest.AssertTimeEqualWithPrecision(t, filename, modTime, fi.ModTime(), r.Fremote.Precision())
 	}
 }
+
+// Test the cache reading a file that this VFS wrote empty and uploaded,
+// which is then updated externally to a larger size. The cache item is
+// clean with a size of 0, so a first read at offset 0 is not below the
+// stale cached size: the handle must check the remote object before it
+// decides it is at EOF, or the stale empty item is served for ever.
+func TestRWCacheUpdateFromEmpty(t *testing.T) {
+	opt := vfscommon.Opt
+	opt.CacheMode = vfscommon.CacheModeFull
+	opt.WriteBack = writeBackDelay
+	opt.DirCacheTime = fs.Duration(100 * time.Millisecond)
+	opt.HandleCaching = 0
+	r, vfs := newTestVFSOpt(t, &opt)
+
+	if r.Fremote.Precision() == fs.ModTimeNotSupported {
+		t.Skip("skip as modtime not supported")
+	}
+
+	const filename = "TestRWCacheUpdateFromEmpty"
+
+	// Write the file empty through the VFS and wait for its upload, so
+	// the cache holds a clean, fingerprinted item of size 0
+	require.NoError(t, vfs.WriteFile(filename, nil, 0644))
+	vfs.WaitForWriters(waitForWritersDelay)
+	require.Eventually(t, func() bool {
+		item := vfs.cache.Item(filename)
+		return item.Exists() && item.WrittenBack() && !item.IsDirty()
+	}, 10*time.Second, 10*time.Millisecond)
+
+	modTime := time.Now().Add(-time.Hour)
+	for i, contents := range []string{"now the file has content", "", "and content again"} {
+		modTime = modTime.Add(time.Minute)
+		file1 := r.WriteObject(context.Background(), filename, contents, modTime)
+		r.CheckRemoteItems(t, file1)
+
+		// Wait for directory cache to expire
+		time.Sleep(time.Duration(2 * opt.DirCacheTime))
+
+		fi, err := vfs.Stat(filename)
+		require.NoError(t, err)
+		assert.Equal(t, int64(len(contents)), fi.Size(), "round %d", i)
+
+		data, err := vfs.ReadFile(filename)
+		require.NoError(t, err, "round %d", i)
+		require.Equal(t, contents, string(data), "round %d", i)
+	}
+}

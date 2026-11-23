@@ -844,3 +844,115 @@ func TestInternalFlushGoneDir(t *testing.T) {
 	_, ok := f.dirCache.Get("")
 	assert.True(t, ok, "the root is never flushed by a change")
 }
+
+// The trash guard (#10973) looks for the cached folders of a path by
+// (parent, name) among the trashed folders and keeps only the IDs the cache
+// holds: a trashed folder of the same parent and name but another ID (an
+// earlier delete of the same path) is not on the path.
+func TestInternalTrashGuardQuery(t *testing.T) {
+	f := &Fs{}
+	f.dirCache = dircache.New("", "rootID", f)
+	f.dirCache.Put("", "rootID")
+	f.dirCache.Put("a", "idA")
+	f.dirCache.Put("a/it's", "idB")
+	ident := func(s string) string { return s }
+
+	folders := cachedFolders(f.dirCache, "rootID", "a/it's/c", ident)
+	require.Len(t, folders, 2, "stops at the first folder the cache does not hold")
+	assert.Equal(t, pathFolder{path: "a", name: "a", id: "idA", parentID: "rootID"}, folders[0])
+	assert.Equal(t, pathFolder{path: "a/it's", name: "it's", id: "idB", parentID: "idA"}, folders[1])
+	assert.Empty(t, cachedFolders(f.dirCache, "rootID", "", ident), "the root is never checked")
+
+	assert.Equal(t,
+		`trashed=true and mimeType='application/vnd.google-apps.folder' and `+
+			`((name='a' and 'rootID' in parents) or (name='it\'s' and 'idA' in parents))`,
+		trashedFolderQuery(folders))
+
+	assert.Equal(t, -1, shallowestTrashed(folders, map[string]bool{}))
+	assert.Equal(t, -1, shallowestTrashed(folders, map[string]bool{"idOldA": true}),
+		"an earlier trashed folder of the same name is not on the path")
+	assert.Equal(t, 1, shallowestTrashed(folders, map[string]bool{"idB": true}))
+	assert.Equal(t, 0, shallowestTrashed(folders, map[string]bool{"idA": true, "idB": true}),
+		"the shallowest trashed folder is the one flushed")
+}
+
+// A write that failed with 404 flushes the cached folders of its path from
+// the top, so the retry resolves them anew; other errors and the root keep
+// the cache.
+func TestInternalFlushGoneParent(t *testing.T) {
+	f := &Fs{}
+	f.dirCache = dircache.New("", "rootID", f)
+	f.dirCache.Put("", "rootID")
+	f.dirCache.Put("a", "idA")
+	f.dirCache.Put("a/b", "idB")
+	f.dirCache.Put("c", "idC")
+	cached := func(p string) bool { _, ok := f.dirCache.Get(p); return ok }
+
+	f.flushGoneParent("a/b/x", errors.New("some other failure"))
+	assert.True(t, cached("a/b"))
+	f.flushGoneParent("a/b/x", &googleapi.Error{Code: 403})
+	assert.True(t, cached("a/b"))
+	f.flushGoneParent("x", &googleapi.Error{Code: 404})
+	assert.True(t, cached(""), "the root is never flushed")
+	f.flushGoneParent("a/b/x", fmt.Errorf("upload: %w", &googleapi.Error{Code: 404}))
+	assert.False(t, cached("a"))
+	assert.False(t, cached("a/b"))
+	assert.True(t, cached("c"))
+}
+
+// The change poll can flush the path between a write and its check (or the
+// path can be cached anew with other folders): the cache no longer covers
+// the folder the write used, so the guard reads the folders upwards from it
+// and still finds the trashed one.
+func TestInternalTrashGuardCacheFlushedMeanwhile(t *testing.T) {
+	f := &Fs{}
+	f.dirCache = dircache.New("", "rootID", f)
+	f.dirCache.Put("", "rootID")
+	ident := func(s string) string { return s }
+
+	// the write used a/b/c = idC; the poll flushed "a" before the check
+	flushed := cachedFolders(f.dirCache, "rootID", "a/b/c", ident)
+	assert.False(t, cacheCoversPath(flushed, "a/b/c", "idC"))
+	f.dirCache.Put("a", "idA")
+	f.dirCache.Put("a/b", "idB")
+	f.dirCache.Put("a/b/c", "idNewC") // cached anew by another write
+	assert.False(t, cacheCoversPath(cachedFolders(f.dirCache, "rootID", "a/b/c", ident), "a/b/c", "idC"))
+	f.dirCache.Put("a/b/c", "idC")
+	assert.True(t, cacheCoversPath(cachedFolders(f.dirCache, "rootID", "a/b/c", ident), "a/b/c", "idC"))
+	assert.True(t, cacheCoversPath(nil, "", "rootID"), "the root is never checked")
+
+	// Drive: "a" was trashed explicitly (flagged at once), b and c not yet
+	tree := map[string]folderState{
+		"idC": {parents: []string{"idB"}},
+		"idB": {parents: []string{"idA"}},
+		"idA": {parents: []string{"rootID"}, trashed: true},
+	}
+	var reads []string
+	get := func(id string) (folderState, error) {
+		reads = append(reads, id)
+		st, ok := tree[id]
+		if !ok {
+			return folderState{}, &googleapi.Error{Code: 404}
+		}
+		return st, nil
+	}
+	gone, err := trashedAncestor(get, "a/b/c", "idC", "rootID")
+	require.NoError(t, err)
+	assert.Equal(t, "a", gone)
+	assert.Equal(t, []string{"idC", "idB", "idA"}, reads, "one read per level, never the root")
+
+	tree["idB"] = folderState{parents: []string{"idA"}, trashed: true}
+	reads = nil
+	gone, err = trashedAncestor(get, "a/b/c", "idC", "rootID")
+	require.NoError(t, err)
+	assert.Equal(t, "a", gone, "the shallowest trashed folder is the one flushed")
+
+	tree["idA"] = folderState{parents: []string{"rootID"}}
+	tree["idB"] = folderState{parents: []string{"idA"}}
+	gone, err = trashedAncestor(get, "a/b/c", "idC", "rootID")
+	require.NoError(t, err)
+	assert.Equal(t, "", gone)
+
+	_, err = trashedAncestor(get, "x/y", "idGone", "rootID")
+	assert.Error(t, err, "a folder removed for good fails the check")
+}

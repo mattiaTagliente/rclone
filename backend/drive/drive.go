@@ -2597,16 +2597,22 @@ func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 			return f.shouldRetry(ctx, err)
 		})
 		if err != nil {
+			f.flushGoneParent(remote, err)
 			return nil, err
 		}
 	} else {
 		// Upload the file in chunks
 		info, err = f.Upload(ctx, in, size, srcMimeType, "", remote, createInfo)
 		if err != nil {
+			f.flushGoneParent(remote, err)
 			return nil, err
 		}
 	}
 	err = updateMetadata(ctx, info)
+	if err != nil {
+		return nil, err
+	}
+	info, err = f.fileOutOfTrash(ctx, remote, info)
 	if err != nil {
 		return nil, err
 	}
@@ -2672,6 +2678,10 @@ func (f *Fs) MergeDirs(ctx context.Context, dirs []fs.Directory) error {
 // Mkdir creates the container if it doesn't exist
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	_, err := f.dirCache.FindDir(ctx, dir, true)
+	if err != nil {
+		return err
+	}
+	_, err = f.mkdirOutOfTrash(ctx, dir)
 	return err
 }
 
@@ -2902,6 +2912,10 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		info, err = copy.Context(ctx).Do()
 		return f.shouldRetry(ctx, err)
 	})
+	if err != nil {
+		return nil, err
+	}
+	info, err = f.fileOutOfTrash(ctx, remote, info)
 	if err != nil {
 		return nil, err
 	}
@@ -3141,6 +3155,10 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	if err != nil {
 		return nil, err
 	}
+	info, err = f.fileOutOfTrash(ctx, remote, info)
+	if err != nil {
+		return nil, err
+	}
 	return f.newObjectWithInfo(ctx, remote, info)
 }
 
@@ -3222,7 +3240,8 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		return err
 	}
 	srcFs.dirCache.FlushDir(srcRemote)
-	return nil
+	_, err = f.keepOutOfTrash(ctx, dstRemote, srcID, dstDirectoryID, true)
+	return err
 }
 
 // ChangeNotify calls the passed function with a path that has had changes.
@@ -4575,6 +4594,10 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return err
 	}
 	err = updateMetadata(ctx, info)
+	if err != nil {
+		return err
+	}
+	info, err = o.fs.fileOutOfTrash(ctx, o.remote, info)
 	if err != nil {
 		return err
 	}

@@ -844,3 +844,58 @@ func TestInternalFlushGoneDir(t *testing.T) {
 	_, ok := f.dirCache.Get("")
 	assert.True(t, ok, "the root is never flushed by a change")
 }
+
+// The trash guard (#10973) looks for the cached folders of a path by
+// (parent, name) among the trashed folders and keeps only the IDs the cache
+// holds: a trashed folder of the same parent and name but another ID (an
+// earlier delete of the same path) is not on the path.
+func TestInternalTrashGuardQuery(t *testing.T) {
+	f := &Fs{}
+	f.dirCache = dircache.New("", "rootID", f)
+	f.dirCache.Put("", "rootID")
+	f.dirCache.Put("a", "idA")
+	f.dirCache.Put("a/it's", "idB")
+	ident := func(s string) string { return s }
+
+	folders := cachedFolders(f.dirCache, "rootID", "a/it's/c", ident)
+	require.Len(t, folders, 2, "stops at the first folder the cache does not hold")
+	assert.Equal(t, pathFolder{path: "a", name: "a", id: "idA", parentID: "rootID"}, folders[0])
+	assert.Equal(t, pathFolder{path: "a/it's", name: "it's", id: "idB", parentID: "idA"}, folders[1])
+	assert.Empty(t, cachedFolders(f.dirCache, "rootID", "", ident), "the root is never checked")
+
+	assert.Equal(t,
+		`trashed=true and mimeType='application/vnd.google-apps.folder' and `+
+			`((name='a' and 'rootID' in parents) or (name='it\'s' and 'idA' in parents))`,
+		trashedFolderQuery(folders))
+
+	assert.Equal(t, -1, shallowestTrashed(folders, map[string]bool{}))
+	assert.Equal(t, -1, shallowestTrashed(folders, map[string]bool{"idOldA": true}),
+		"an earlier trashed folder of the same name is not on the path")
+	assert.Equal(t, 1, shallowestTrashed(folders, map[string]bool{"idB": true}))
+	assert.Equal(t, 0, shallowestTrashed(folders, map[string]bool{"idA": true, "idB": true}),
+		"the shallowest trashed folder is the one flushed")
+}
+
+// A write that failed with 404 flushes the cached folders of its path from
+// the top, so the retry resolves them anew; other errors and the root keep
+// the cache.
+func TestInternalFlushGoneParent(t *testing.T) {
+	f := &Fs{}
+	f.dirCache = dircache.New("", "rootID", f)
+	f.dirCache.Put("", "rootID")
+	f.dirCache.Put("a", "idA")
+	f.dirCache.Put("a/b", "idB")
+	f.dirCache.Put("c", "idC")
+	cached := func(p string) bool { _, ok := f.dirCache.Get(p); return ok }
+
+	f.flushGoneParent("a/b/x", errors.New("some other failure"))
+	assert.True(t, cached("a/b"))
+	f.flushGoneParent("a/b/x", &googleapi.Error{Code: 403})
+	assert.True(t, cached("a/b"))
+	f.flushGoneParent("x", &googleapi.Error{Code: 404})
+	assert.True(t, cached(""), "the root is never flushed")
+	f.flushGoneParent("a/b/x", fmt.Errorf("upload: %w", &googleapi.Error{Code: 404}))
+	assert.False(t, cached("a"))
+	assert.False(t, cached("a/b"))
+	assert.True(t, cached("c"))
+}

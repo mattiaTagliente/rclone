@@ -875,6 +875,7 @@ type Fs struct {
 	dirResourceKeys  *sync.Map                    // map directory ID to resource key
 	permissionsMu    *sync.Mutex                  // protect the below
 	permissions      map[string]*drive.Permission // map permission IDs to Permissions
+	changeLog        *changeLog                   // the change events the change poll received
 }
 
 type baseObject struct {
@@ -3251,6 +3252,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 //
 // Close the returned channel to stop being notified.
 func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryType), pollIntervalChan <-chan time.Duration) {
+	f.startChangeLog()
 	go func() {
 		// get the StartPageToken early so all changes from now on get processed
 		startPageToken, err := f.changeNotifyStartPageToken(ctx)
@@ -3361,6 +3363,7 @@ func (f *Fs) changeNotifyRunner(ctx context.Context, notifyFunc func(string, fs.
 		}
 		var pathsToClear []entryType
 		for _, change := range changeList.Changes {
+			first := len(pathsToClear)
 			// find the previous path
 			if path, ok := f.dirCache.GetInv(change.FileId); ok {
 				if change.File != nil && change.File.MimeType != driveFolderType {
@@ -3393,6 +3396,11 @@ func (f *Fs) changeNotifyRunner(ctx context.Context, notifyFunc func(string, fs.
 					pathsToClear = append(pathsToClear, entryType{path: change.File.Name, entryType: changeType})
 				}
 			}
+			var paths []string
+			for _, e := range pathsToClear[first:] {
+				paths = append(paths, e.path)
+			}
+			f.recordChange(change, paths)
 		}
 
 		visitedPaths := make(map[string]struct{})
@@ -4055,6 +4063,42 @@ Third delete all orphaned files to the trash:
 ` + "```console" + `
 rclone backend rescue drive: -o delete
 ` + "```",
+}, {
+	Name:  "changes",
+	Short: "List the change events the change poll of this remote received.",
+	Long: `This lists the changes the change poll (a mount's --poll-interval) of
+this remote received since a sequence number, from a bounded log kept in
+memory, so a process that keeps its own view of the remote can stay
+current without a second poller. The answer names the log's epoch (new for
+each poll started), the first and last sequence kept, and overflow when
+records after since were dropped (or epoch names another poll): the
+reader then lists anew. Each change has its seq, time, the Drive ID, the
+removed, trashed and folder flags, the name and the paths the directory
+cache resolved for it.
+
+Usage example:
+
+` + "```console" + `
+rclone rc backend/command command=changes fs=drive: -o since=120 -o epoch=4f2a...
+` + "```",
+	Opts: map[string]string{
+		"since": "Answer the changes after this sequence number (default 0).",
+		"epoch": "The epoch the reader's since belongs to; another one answers overflow.",
+		"max":   "Answer at most this many changes (default 5000).",
+	},
+}, {
+	Name:  "untrashid",
+	Short: "Restore trashed objects by ID to paths.",
+	Long: `This restores each trashed object named by its ID to a path, in one update:
+out of the trash, under the path's leaf name, in the path's folder (made when
+missing). A path that already holds an object is refused, so a restore never
+overwrites.
+
+Usage example:
+
+` + "```console" + `
+rclone backend untrashid drive: ID1 path1 ID2 path2
+` + "```",
 }}
 
 // Command the backend to run a named command
@@ -4168,6 +4212,23 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 			}
 		}
 		return nil, nil
+	case "changes":
+		return f.changesCommand(opt)
+	case "untrashid":
+		if len(arg)%2 != 0 || len(arg) == 0 {
+			return nil, errors.New("need pairs of arguments: ID path")
+		}
+		var out []untrashResult
+		for len(arg) > 0 {
+			id, dest := arg[0], arg[1]
+			arg = arg[2:]
+			r, err := f.untrashID(ctx, id, dest)
+			if err != nil {
+				return out, fmt.Errorf("failed untrashid %q to %q: %w", id, dest, err)
+			}
+			out = append(out, r)
+		}
+		return out, nil
 	case "exportformats":
 		return f.exportFormats(ctx), nil
 	case "importformats":

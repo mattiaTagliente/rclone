@@ -812,3 +812,35 @@ func (f *Fs) InternalTest(t *testing.T) {
 }
 
 var _ fstests.InternalTester = (*Fs)(nil)
+
+// A folder trashed or removed by another process is flushed from the
+// directory cache when the change notification reports it, so the next
+// write at its path resolves the folder anew instead of creating the file
+// inside the trash. A live folder's change keeps the entry.
+func TestInternalFlushGoneDir(t *testing.T) {
+	f := &Fs{}
+	f.dirCache = dircache.New("", "rootID", f)
+	f.dirCache.Put("a", "idA")
+	f.dirCache.Put("a/b", "idB")
+	f.dirCache.Put("c", "idC")
+	f.dirCache.Put("d", "idD")
+	gone := func(id string) bool {
+		_, ok := f.dirCache.GetInv(id)
+		return !ok
+	}
+
+	f.flushGoneDir(&drive.Change{FileId: "idC", File: &drive.File{MimeType: driveFolderType}}, "c")
+	assert.False(t, gone("idC"), "a live folder's change keeps its entry")
+
+	f.flushGoneDir(&drive.Change{FileId: "idA", File: &drive.File{MimeType: driveFolderType, Trashed: true}}, "a")
+	assert.True(t, gone("idA"), "a trashed folder is flushed")
+	assert.True(t, gone("idB"), "and every folder below it")
+	assert.False(t, gone("idC"))
+
+	f.flushGoneDir(&drive.Change{FileId: "idD", Removed: true}, "d")
+	assert.True(t, gone("idD"), "a removed folder is flushed")
+
+	f.flushGoneDir(&drive.Change{FileId: "rootID", Removed: true}, "")
+	_, ok := f.dirCache.Get("")
+	assert.True(t, ok, "the root is never flushed by a change")
+}

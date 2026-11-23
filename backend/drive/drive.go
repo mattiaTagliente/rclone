@@ -3291,6 +3291,23 @@ func (f *Fs) changeNotifyStartPageToken(ctx context.Context) (pageToken string, 
 	return startPageToken.StartPageToken, nil
 }
 
+// flushGoneDir drops the directory cache entries of the folder at path,
+// and of every folder below it, when the change reports that folder
+// trashed or removed by another process. Kept, the cached ID still pointed
+// at the trashed folder, so a file or folder created at that path was
+// created inside the trash and lost, while the upload was reported as a
+// success; a removed folder failed every later upload under it with 404.
+// Only Rmdir and Purge done by this process flushed the entry before.
+func (f *Fs) flushGoneDir(change *drive.Change, path string) {
+	if path == "" {
+		return // the root: never flushed by a change
+	}
+	if change.Removed || (change.File != nil && change.File.Trashed) {
+		fs.Debugf(f, "Change notify: folder %q is gone, flushing its directory cache", path)
+		f.dirCache.FlushDir(path)
+	}
+}
+
 func (f *Fs) changeNotifyRunner(ctx context.Context, notifyFunc func(string, fs.EntryType), startPageToken string) (newStartPageToken string, err error) {
 	pageToken := startPageToken
 	for {
@@ -3298,7 +3315,7 @@ func (f *Fs) changeNotifyRunner(ctx context.Context, notifyFunc func(string, fs.
 
 		err = f.pacer.Call(func() (bool, error) {
 			changesCall := f.svc.Changes.List(pageToken).
-				Fields("nextPageToken,newStartPageToken,changes(fileId,file(name,parents,mimeType))")
+				Fields("nextPageToken,newStartPageToken,changes(fileId,removed,file(name,parents,mimeType,trashed))")
 			if f.opt.ListChunk > 0 {
 				changesCall.PageSize(f.opt.ListChunk)
 			}
@@ -3331,6 +3348,7 @@ func (f *Fs) changeNotifyRunner(ctx context.Context, notifyFunc func(string, fs.
 					pathsToClear = append(pathsToClear, entryType{path: path, entryType: fs.EntryObject})
 				} else {
 					pathsToClear = append(pathsToClear, entryType{path: path, entryType: fs.EntryDirectory})
+					f.flushGoneDir(change, path)
 				}
 			}
 

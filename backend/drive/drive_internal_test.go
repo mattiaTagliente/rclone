@@ -508,6 +508,44 @@ func (f *Fs) InternalTestUnTrash(t *testing.T) {
 	require.NoError(t, f.Purge(ctx, "trashDir"))
 }
 
+// TestIntegration/FsMkdir/FsPutFiles/Internal/UnTrashID
+func (f *Fs) InternalTestUnTrashID(t *testing.T) {
+	ctx := context.Background()
+
+	contents := random.String(100)
+	file1 := fstest.NewItem("untrashID/toBeTrashed", contents, time.Now())
+	obj1 := fstests.PutTestContents(ctx, t, f, &file1, contents, false)
+	file2 := fstest.NewItem("untrashID/occupied", contents, time.Now())
+	_ = fstests.PutTestContents(ctx, t, f, &file2, contents, false)
+	id := obj1.(fs.IDer).ID()
+
+	// An object not in the trash is refused
+	_, err := f.untrashID(ctx, id, "untrashID/restored/file")
+	require.Error(t, err)
+
+	require.Equal(t, true, f.opt.UseTrash)
+	require.NoError(t, obj1.Remove(ctx))
+
+	// A path holding an object is refused, the object stays in the trash
+	_, err = f.untrashID(ctx, id, "untrashID/occupied")
+	assert.True(t, errors.Is(err, errTargetExists), "err = %v", err)
+	fstest.CheckListingWithRoot(t, f, "untrashID", []fstest.Item{file2}, []string{}, f.Precision())
+
+	// Restore under another name in a folder that does not exist yet
+	r, err := f.untrashID(ctx, id, "untrashID/restored/file")
+	require.NoError(t, err)
+	assert.Equal(t, id, r.ID)
+	assert.Equal(t, int64(len(contents)), r.Size)
+	file1.Path = "untrashID/restored/file"
+	fstest.CheckListingWithRoot(t, f, "untrashID", []fstest.Item{file1, file2}, []string{"untrashID/restored"}, f.Precision())
+
+	// Through the backend command
+	_, err = f.Command(ctx, "untrashid", []string{id}, nil)
+	assert.Error(t, err, "an ID without a path is refused")
+
+	require.NoError(t, f.Purge(ctx, "untrashID"))
+}
+
 // TestIntegration/FsMkdir/FsPutFiles/Internal/CopyOrMoveID
 func (f *Fs) InternalTestCopyOrMoveID(t *testing.T) {
 	ctx := context.Background()
@@ -803,6 +841,7 @@ func (f *Fs) InternalTest(t *testing.T) {
 	})
 	t.Run("Shortcuts", f.InternalTestShortcuts)
 	t.Run("UnTrash", f.InternalTestUnTrash)
+	t.Run("UnTrashID", f.InternalTestUnTrashID)
 	t.Run("CopyOrMoveID", f.InternalTestCopyOrMoveID)
 	t.Run("Query", f.InternalTestQuery)
 	t.Run("AgeQuery", f.InternalTestAgeQuery)

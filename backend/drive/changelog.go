@@ -5,19 +5,12 @@ package drive
 // command, so a process that keeps its own view of the remote (a census
 // of a folder) can stay current from the events the mount already
 // receives, without a second poller and a second Drive auth.
-//
-// The "untrashid" backend command restores a trashed object by its ID
-// to a path, refusing a path that already holds an object.
 
 import (
-	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"fmt"
-	"path"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -94,7 +87,10 @@ func (l *changeLog) since(seq int64, max int) changesResult {
 	if seq < 0 {
 		seq = 0
 	}
-	if seq+1 < first {
+	// A position past the last record, or before the oldest one kept, is
+	// not continuous with this log: the reader lists anew. Compared before
+	// any increment, so no seq overflows.
+	if seq > last || seq < first-1 {
 		res.Overflow = true
 		return res
 	}
@@ -107,41 +103,80 @@ func (l *changeLog) since(seq int64, max int) changesResult {
 	return res
 }
 
-// changeLogs holds the log of each Fs whose change poll runs, by its
-// config string: an rc call may reach another instance of the same
+// changeLogs holds the logs of the change polls that run, by the config
+// string of their Fs: an rc call may reach another instance of the same
 // remote than the mount's (the cache pins the mount's, but not forever).
+// Two polls of the same remote each keep their log, oldest first; the
+// newest is served, and the other one again once the newest stops.
 var (
 	changeLogsMu sync.Mutex
-	changeLogs   = map[string]*changeLog{}
+	changeLogs   = map[string][]*changeLog{}
 )
 
 func (f *Fs) changeLogKey() string {
 	return fs.ConfigString(f)
 }
 
-// startChangeLog makes the log a new change poll records into.
+// startChangeLog makes the log a change poll records into from a new
+// start page token on: a new epoch, since changes before that token
+// may have been missed.
 func (f *Fs) startChangeLog() *changeLog {
 	l := newChangeLog(changeLogSize)
 	changeLogsMu.Lock()
-	changeLogs[f.changeLogKey()] = l
+	key := f.changeLogKey()
+	changeLogs[key] = append(changeLogs[key], l)
 	changeLogsMu.Unlock()
-	f.changeLog = l
+	return l
+}
+
+// stopChangeLog withdraws l once its poll stopped or lost continuity.
+// The logs of other polls stay in place.
+func (f *Fs) stopChangeLog(l *changeLog) {
+	if l == nil {
+		return
+	}
+	changeLogsMu.Lock()
+	defer changeLogsMu.Unlock()
+	key := f.changeLogKey()
+	logs := changeLogs[key]
+	for i, x := range logs {
+		if x == l {
+			logs = append(logs[:i:i], logs[i+1:]...)
+			break
+		}
+	}
+	if len(logs) == 0 {
+		delete(changeLogs, key)
+	} else {
+		changeLogs[key] = logs
+	}
+}
+
+// keepChangeLog returns the log a poll records into after a run that
+// left it the start page token: none after a run that lost the token,
+// since the next token may skip changes, so the log is withdrawn at once
+// rather than served as running until that token is fetched.
+func (f *Fs) keepChangeLog(startPageToken string, l *changeLog) *changeLog {
+	if startPageToken == "" {
+		f.stopChangeLog(l)
+		return nil
+	}
 	return l
 }
 
 func (f *Fs) findChangeLog() *changeLog {
-	if f.changeLog != nil {
-		return f.changeLog
-	}
 	changeLogsMu.Lock()
 	defer changeLogsMu.Unlock()
-	return changeLogs[f.changeLogKey()]
+	logs := changeLogs[f.changeLogKey()]
+	if len(logs) == 0 {
+		return nil
+	}
+	return logs[len(logs)-1]
 }
 
-// recordChange keeps one change event with the paths the dir cache
-// resolved for it.
-func (f *Fs) recordChange(change *drive.Change, paths []string) {
-	l := f.changeLog
+// record keeps one change event with the paths the dir cache resolved
+// for it. A nil log records nothing.
+func (l *changeLog) record(change *drive.Change, paths []string) {
 	if l == nil || change == nil {
 		return
 	}
@@ -183,76 +218,4 @@ func (f *Fs) changesCommand(opt map[string]string) (any, error) {
 		res.Overflow, res.Changes = true, []changeRecord{}
 	}
 	return res, nil
-}
-
-// untrashResult is what "untrashid" answers per object restored.
-type untrashResult struct {
-	ID      string `json:"id"`
-	Path    string `json:"path"`
-	Size    int64  `json:"size"`
-	MD5     string `json:"md5"`
-	ModTime string `json:"modTime"`
-}
-
-var errTargetExists = errors.New("an object already exists at the target path")
-
-// untrashID restores the trashed object id to dest (relative to the Fs
-// root) in one update: out of the trash, under dest's leaf name, in
-// dest's folder (made when missing). A dest that already holds an
-// object is refused: a restore never overwrites, the caller names
-// another path.
-func (f *Fs) untrashID(ctx context.Context, id, dest string) (untrashResult, error) {
-	var res untrashResult
-	if _, err := f.NewObject(ctx, dest); err == nil {
-		return res, fmt.Errorf("%q: %w", dest, errTargetExists)
-	} else if !errors.Is(err, fs.ErrorObjectNotFound) && !errors.Is(err, fs.ErrorIsDir) {
-		return res, err
-	} else if errors.Is(err, fs.ErrorIsDir) {
-		return res, fmt.Errorf("%q is a directory: %w", dest, errTargetExists)
-	}
-	var info *drive.File
-	err := f.pacer.Call(func() (bool, error) {
-		var err error
-		info, err = f.svc.Files.Get(actualID(id)).Fields("id,name,parents,trashed,mimeType").
-			SupportsAllDrives(true).Context(ctx).Do()
-		return f.shouldRetry(ctx, err)
-	})
-	if err != nil {
-		return res, fmt.Errorf("couldn't read %q: %w", id, err)
-	}
-	if info.MimeType == driveFolderType {
-		return res, fmt.Errorf("%q is a folder: untrash restores objects only", id)
-	}
-	if !info.Trashed {
-		return res, fmt.Errorf("%q is not in the trash", id)
-	}
-	dir, leaf := path.Split(dest)
-	dirID, err := f.dirCache.FindDir(ctx, path.Clean("/" + dir)[1:], true)
-	if err != nil {
-		return res, fmt.Errorf("couldn't find or make the folder of %q: %w", dest, err)
-	}
-	update := &drive.File{Name: f.opt.Enc.FromStandardName(leaf)}
-	update.Trashed = false
-	update.ForceSendFields = []string{"Trashed"}
-	call := f.svc.Files.Update(info.Id, update).AddParents(dirID).
-		Fields("id,name,parents,size,md5Checksum,modifiedTime,trashed").SupportsAllDrives(true)
-	var remove []string
-	for _, p := range info.Parents {
-		if p != dirID {
-			remove = append(remove, p)
-		}
-	}
-	if len(remove) > 0 {
-		call.RemoveParents(strings.Join(remove, ","))
-	}
-	var out *drive.File
-	err = f.pacer.Call(func() (bool, error) {
-		var err error
-		out, err = call.Context(ctx).Do()
-		return f.shouldRetry(ctx, err)
-	})
-	if err != nil {
-		return res, fmt.Errorf("couldn't untrash %q to %q: %w", id, dest, err)
-	}
-	return untrashResult{ID: out.Id, Path: dest, Size: out.Size, MD5: out.Md5Checksum, ModTime: out.ModifiedTime}, nil
 }

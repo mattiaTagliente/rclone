@@ -875,7 +875,6 @@ type Fs struct {
 	dirResourceKeys  *sync.Map                    // map directory ID to resource key
 	permissionsMu    *sync.Mutex                  // protect the below
 	permissions      map[string]*drive.Permission // map permission IDs to Permissions
-	changeLog        *changeLog                   // the change events the change poll received
 }
 
 type baseObject struct {
@@ -3252,12 +3251,17 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 //
 // Close the returned channel to stop being notified.
 func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryType), pollIntervalChan <-chan time.Duration) {
-	f.startChangeLog()
 	go func() {
+		// the change log of the current start page token: a token fetched
+		// anew may have skipped changes, so it starts a new log
+		var clog *changeLog
+		defer func() { f.stopChangeLog(clog) }()
 		// get the StartPageToken early so all changes from now on get processed
 		startPageToken, err := f.changeNotifyStartPageToken(ctx)
 		if err != nil {
 			fs.Infof(f, "Failed to get StartPageToken: %s", err)
+		} else {
+			clog = f.startChangeLog()
 		}
 		var ticker *time.Ticker
 		var tickerC <-chan time.Time
@@ -3285,12 +3289,14 @@ func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryT
 						fs.Infof(f, "Failed to get StartPageToken: %s", err)
 						continue
 					}
+					clog = f.startChangeLog()
 				}
 				fs.Debugf(f, "Checking for changes on remote")
-				startPageToken, err = f.changeNotifyRunner(ctx, notifyFunc, startPageToken)
+				startPageToken, err = f.changeNotifyRunner(ctx, notifyFunc, startPageToken, clog)
 				if err != nil {
 					fs.Infof(f, "Change notify listener failure: %s", err)
 				}
+				clog = f.keepChangeLog(startPageToken, clog)
 			}
 		}
 	}()
@@ -3329,7 +3335,7 @@ func (f *Fs) flushGoneDir(change *drive.Change, path string) {
 	}
 }
 
-func (f *Fs) changeNotifyRunner(ctx context.Context, notifyFunc func(string, fs.EntryType), startPageToken string) (newStartPageToken string, err error) {
+func (f *Fs) changeNotifyRunner(ctx context.Context, notifyFunc func(string, fs.EntryType), startPageToken string, clog *changeLog) (newStartPageToken string, err error) {
 	pageToken := startPageToken
 	for {
 		var changeList *drive.ChangeList
@@ -3400,7 +3406,7 @@ func (f *Fs) changeNotifyRunner(ctx context.Context, notifyFunc func(string, fs.
 			for _, e := range pathsToClear[first:] {
 				paths = append(paths, e.path)
 			}
-			f.recordChange(change, paths)
+			clog.record(change, paths)
 		}
 
 		visitedPaths := make(map[string]struct{})
@@ -4069,9 +4075,11 @@ rclone backend rescue drive: -o delete
 	Long: `This lists the changes the change poll (a mount's --poll-interval) of
 this remote received since a sequence number, from a bounded log kept in
 memory, so a process that keeps its own view of the remote can stay
-current without a second poller. The answer names the log's epoch (new for
-each poll started), the first and last sequence kept, and overflow when
-records after since were dropped (or epoch names another poll): the
+current without a second poller. The answer says running only while a poll
+records continuously. It names the log's epoch (new each time the poll starts
+from a fresh start page token, since changes before it may be missed), the
+first and last sequence kept, and overflow when records after since were
+dropped, since is past the last record, or epoch names another log: the
 reader then lists anew. Each change has its seq, time, the Drive ID, the
 removed, trashed and folder flags, the name and the paths the directory
 cache resolved for it.
@@ -4091,8 +4099,10 @@ rclone rc backend/command command=changes fs=drive: -o since=120 -o epoch=4f2a..
 	Short: "Restore trashed objects by ID to paths.",
 	Long: `This restores each trashed object named by its ID to a path, in one update:
 out of the trash, under the path's leaf name, in the path's folder (made when
-missing). A path that already holds an object is refused, so a restore never
-overwrites.
+missing), keeping its modification time. A path that holds an object when it
+is checked is refused, so a restore never replaces an object. Drive allows two
+objects of the same name in a folder, so an object another writer creates at
+the path meanwhile is not detected.
 
 Usage example:
 
